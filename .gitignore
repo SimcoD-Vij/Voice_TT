@@ -1,0 +1,36 @@
+# Environment
+.venv/
+pyvenv.cfg
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Models and Large Data (Required to be downloaded externally)
+models/
+dataset/
+!dataset/voice_prompt.pt
+
+# Outputs
+output/
+outputs/
+*.wav
+!ref_recording_3_15s.wav
+output.txt
+output_full.txt
+
+# OS/IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Docker
+.dockerignore
+# (Keep Dockerfile and docker-compose.yml)
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem

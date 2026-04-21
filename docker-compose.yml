@@ -1,0 +1,37 @@
+services:
+  tts:
+    build: .
+    image: qwen3-tts-cloner
+    container_name: tts-cloner
+    volumes:
+      - ./models:/app/models
+      - ./dataset:/app/dataset
+      - ./outputs:/app/outputs
+      - ./Qwen3-TTS:/app/Qwen3-TTS
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    stdin_open: true
+    tty: true
+
+  tts-cpu:
+    build: .
+    image: qwen3-tts-cloner
+    container_name: tts-cloner-cpu
+    volumes:
+      - ./models:/app/models
+      - ./dataset:/app/dataset
+      - ./outputs:/app/outputs
+      - ./Qwen3-TTS:/app/Qwen3-TTS
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    stdin_open: true
+    tty: true
