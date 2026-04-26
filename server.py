@@ -33,7 +33,8 @@ import base64
 PROJECT_ROOT = Path(__file__).parent.absolute()
 # Ensure local Qwen3-TTS is in path (priority)
 sys.path.insert(0, str(PROJECT_ROOT / "Qwen3-TTS"))
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Security, status
+from fastapi.security import APIKeyHeader
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import torch
@@ -46,8 +47,22 @@ VOICE_META_PATH = DATASET_DIR / "voice_meta.json"
 # Global state — loaded once
 _model = None
 _voice_prompt = None
-_model_id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+_model_id = r"D:\voice tts\models\Qwen3-TTS-12Hz-0.6B-Base"
 _sample_rate = 24000
+_expected_api_key = None  # Set at startup
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if _expected_api_key:
+        if api_key != _expected_api_key:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing API Key",
+                headers={"WWW-Authenticate": API_KEY_NAME},
+            )
+    return api_key
 
 # CPU Optimizations
 if not torch.cuda.is_available():
@@ -131,6 +146,26 @@ class Qwen3TTSWebSocketStreamer:
         self.is_finished = True
 
 
+def clean_text(text: str) -> str:
+    """Strip Llama 3.2 / ChatML headers and other leaked tokens."""
+    if not text:
+        return ""
+    
+    # Common leaked tokens
+    to_strip = [
+        "<|start_header_id|>", "<|end_header_id|>", 
+        "<|reserved_special_token", "<|begin_of_text|>",
+        "assistant", "user", "system"
+    ]
+    
+    cleaned = text
+    for token in to_strip:
+        cleaned = cleaned.replace(token, "")
+    
+    # Strip any leading/trailing whitespace or punctuation that might be left
+    return cleaned.strip()
+
+
 async def stream_audio_from_codes(model, codes_queue: asyncio.Queue, websocket: WebSocket, context_id: str, chunk_size: int = 12):
     """Worker that takes codec tokens from a queue, decodes them, and sends audio."""
     accumulated_codes = []
@@ -205,16 +240,20 @@ _current_codes_queue = None
 
 def patch_talker_for_streaming(talker):
     """Patch the talker's forward method to intercept codec tokens."""
-    original_forward = talker.forward
+    # Patch the class to ensure PyTorch __call__ picks it up
+    from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerForConditionalGeneration
+    original_forward = Qwen3TTSTalkerForConditionalGeneration.forward
     
     from functools import wraps
     
     @wraps(original_forward)
-    def streaming_forward(*args, **kwargs):
-        outputs = original_forward(*args, **kwargs)
+    def streaming_forward(self, *args, **kwargs):
+        kwargs["output_hidden_states"] = True
+        kwargs["return_dict"] = True
+        outputs = original_forward(self, *args, **kwargs)
+
         try:
             if _current_codes_queue is not None and hasattr(outputs, "hidden_states"):
-                # hidden_states[1] is codec_ids: (B, 16)
                 h = outputs.hidden_states
                 if isinstance(h, (list, tuple)) and len(h) > 1:
                     codec_ids = h[1]
@@ -222,16 +261,24 @@ def patch_talker_for_streaming(talker):
                         # codec_ids is (B, 16). We take all 16 codes for the first batch item.
                         token = codec_ids[0].detach().cpu()
                         _current_codes_queue.put_nowait(token)
+                        # Remove print after verifying it works, but adding it now to debug
+                        # print(f"[DEBUG] Sent token: {token.shape}")
+                else:
+                    print(f"[DEBUG] hidden_states present but not tuple/list > 1: {type(h)}")
+            elif _current_codes_queue is not None:
+                print(f"[DEBUG] outputs missing hidden_states! {type(outputs)}")
         except Exception as e:
-            print(f"[INTERCEPT ERROR] {e}")
+            print(f"[STREAM DEBUG ERROR]: {e}")
+            import traceback; traceback.print_exc()
+
         return outputs
     
-    talker.forward = streaming_forward
+    Qwen3TTSTalkerForConditionalGeneration.forward = streaming_forward
     return original_forward
 
 
-def create_app(model_id: str):
-    from fastapi import FastAPI, HTTPException
+def create_app(model_id: str, api_key: Optional[str] = None):
+    from fastapi import FastAPI, HTTPException, Depends, Security
     from fastapi.responses import Response, StreamingResponse, JSONResponse
     from pydantic import BaseModel
 
@@ -248,8 +295,9 @@ def create_app(model_id: str):
 
     @app.on_event("startup")
     async def startup():
-        global _model, _voice_prompt, _model_id, _sample_rate
+        global _model, _voice_prompt, _model_id, _sample_rate, _expected_api_key
         _model_id = model_id
+        _expected_api_key = api_key
         print(f"\n{'='*60}")
         print(" QWEN3-TTS SERVER STARTING")
         print(f"{'='*60}")
@@ -275,7 +323,7 @@ def create_app(model_id: str):
             import traceback; traceback.print_exc()
             sys.exit(1)
 
-    @app.get("/health")
+    @app.get("/health", dependencies=[Depends(verify_api_key)])
     async def health():
         return {
             "status": "ok",
@@ -284,14 +332,14 @@ def create_app(model_id: str):
             "sample_rate": _sample_rate,
         }
 
-    @app.get("/voice/info")
+    @app.get("/voice/info", dependencies=[Depends(verify_api_key)])
     async def voice_info():
         if VOICE_META_PATH.exists():
             meta = json.loads(VOICE_META_PATH.read_text(encoding="utf-8"))
             return meta
         return {"info": "No voice metadata found. Run build_voice_prompt.py"}
 
-    @app.post("/generate")
+    @app.post("/generate", dependencies=[Depends(verify_api_key)])
     async def generate(req: GenerateRequest):
         """
         Generate audio WAV from text using your cloned voice.
@@ -335,7 +383,7 @@ def create_app(model_id: str):
             import traceback; traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
 
-    @app.post("/generate/batch")
+    @app.post("/generate/batch", dependencies=[Depends(verify_api_key)])
     async def generate_batch(texts: list[str], language: str = "auto"):
         """Generate audio for multiple texts. Returns JSON with base64 WAV data."""
         import base64
@@ -364,7 +412,16 @@ def create_app(model_id: str):
         return {"results": results, "count": len(results)}
 
     @app.websocket("/voice/stream")
-    async def websocket_endpoint(websocket: WebSocket):
+    async def websocket_endpoint(websocket: WebSocket, api_key: Optional[str] = None):
+        if _expected_api_key:
+            # For WebSockets, we often check a query parameter 'api_key'
+            # fallback to header if available in handshakes (though less reliable)
+            query_key = websocket.query_params.get("api_key")
+            actual_key = query_key or api_key
+            if actual_key != _expected_api_key:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+
         await websocket.accept()
         print(f"[WS] Connection accepted")
         
@@ -387,7 +444,7 @@ def create_app(model_id: str):
                     await websocket.send_json({"type": "context_created", "context_id": context_id})
 
                 elif msg_type == "synthesize":
-                    text = msg.get("text")
+                    text = clean_text(msg.get("text"))
                     context_id = msg.get("context_id", context_id)
                     
                     if not text:
@@ -395,44 +452,44 @@ def create_app(model_id: str):
                         
                     print(f"[WS] Synthesize: {text[:40]}...")
                     
-                    # Start the audio streamer worker
-                    codes_queue = asyncio.Queue()
-                    streamer_task = asyncio.create_task(
-                        stream_audio_from_codes(_model, codes_queue, websocket, context_id, chunk_size=12)
-                    )
-                    
-                    # Run generation in executor
-                    main_loop = asyncio.get_event_loop()
-                    def run_gen(loop):
-                        global _current_codes_queue
-                        _current_codes_queue = codes_queue
+                    # Start synthesis as a background task so we don't block the receive loop
+                    async def perform_synthesis(txt, ctx_id, lang):
+                        codes_q = asyncio.Queue()
+                        streamer_task = asyncio.create_task(
+                            stream_audio_from_codes(_model, codes_q, websocket, ctx_id, chunk_size=12)
+                        )
                         
-                        try:
-                            # Patch talker temporarily
-                            original_forward = patch_talker_for_streaming(_model.model.talker)
-                            
+                        main_loop = asyncio.get_event_loop()
+                        def run_gen(loop):
+                            global _current_codes_queue
+                            _current_codes_queue = codes_q
                             try:
-                                # Run generation
-                                _model.generate_voice_clone(
-                                    text=text,
-                                    language=msg.get("language", "English"),
-                                    voice_clone_prompt=_voice_prompt,
-                                    max_new_tokens=2048,
-                                )
-                            finally:
-                                # Unpatch
-                                _model.model.talker.forward = original_forward
-                                # Signal end of stream
-                                loop.call_soon_threadsafe(codes_queue.put_nowait, None)
-                                _current_codes_queue = None
-                                
-                        except Exception as e:
-                            print(f"[GEN ERROR] {e}")
-                            import traceback; traceback.print_exc()
-                            loop.call_soon_threadsafe(codes_queue.put_nowait, None)
+                                original_forward = patch_talker_for_streaming(_model.model.talker)
+                                try:
+                                    _model.generate_voice_clone(
+                                        text=txt,
+                                        language=lang,
+                                        voice_clone_prompt=_voice_prompt,
+                                        max_new_tokens=2048,
+                                    )
+                                finally:
+                                    from qwen_tts.core.models.modeling_qwen3_tts import Qwen3TTSTalkerForConditionalGeneration
+                                    Qwen3TTSTalkerForConditionalGeneration.forward = original_forward
+                                    if "forward" in _model.model.talker.__dict__:
+                                        del _model.model.talker.forward
+                                    loop.call_soon_threadsafe(codes_q.put_nowait, None)
+                                    _current_codes_queue = None
+                            except Exception as e:
+                                print(f"[GEN ERROR] {e}")
+                                loop.call_soon_threadsafe(codes_q.put_nowait, None)
 
-                    await asyncio.get_event_loop().run_in_executor(None, run_gen, main_loop)
-                    await streamer_task
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(None, run_gen, main_loop)
+                            await streamer_task
+                        except Exception as e:
+                            print(f"[SYNTHESIS TASK ERROR] {e}")
+
+                    asyncio.create_task(perform_synthesis(text, context_id, msg.get("language", "English")))
 
                 elif msg_type == "close_context":
                     # Stop any current generation
@@ -450,12 +507,13 @@ def main():
     parser = argparse.ArgumentParser(description="Qwen3-TTS Voice Clone API Server")
     parser.add_argument("--host", default="localhost", help="Host to bind (use 0.0.0.0 for network access)")
     parser.add_argument("--port", type=int, default=8765, help="Port number")
-    parser.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-0.6B-Base", help="Model ID or local path")
+    parser.add_argument("--model", default=r"D:\voice tts\models\Qwen3-TTS-12Hz-0.6B-Base", help="Model ID or local path")
+    parser.add_argument("--api-key", default=None, help="Optional API Key for authentication")
     parser.add_argument("--reload", action="store_true", help="Enable hot reload for development")
     args = parser.parse_args()
 
     import uvicorn
-    app = create_app(args.model)
+    app = create_app(args.model, args.api_key)
     uvicorn.run(
         app,
         host=args.host,
