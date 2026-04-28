@@ -35,3 +35,37 @@ services:
           memory: 8G
     stdin_open: true
     tty: true
+
+  pocket-tts:
+    build:
+      context: .
+      dockerfile: pocket-tts.Dockerfile
+    image: dograh-pocket-tts
+    container_name: pocket-tts
+    ports:
+      - "8100:8000"
+    volumes:
+      - pocket_tts_models:/root/.cache/huggingface
+      - pocket_tts_voices:/voices
+    networks:
+      - app-network
+    environment:
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - TOKENIZERS_PARALLELISM=false
+      - HF_HUB_DOWNLOAD_TIMEOUT=300
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /tmp/pocket_tts_ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 40
+      start_period: 400s
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  pocket_tts_models:
+  pocket_tts_voices:
