@@ -6,16 +6,30 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Models and Large Data (Required to be downloaded externally)
-models/
-dataset/
-!dataset/voice_prompt.pt
+# Large Data (Ignore specific large files but keep folders)
+*.tar.gz
+*.zip
+*.7z
+*.rar
+*.dll
+*.so
+*.exe
+*.safetensors
+*.bin
+*.onnx
+# Specific large wav files
+dataset/processed/recording_3.wav
+
+# Keep folder structure but ignore content if necessary
+# (Removing models/ and dataset/ from ignore list to include small files/structure)
 
 # Outputs
 output/
 outputs/
 *.wav
 !ref_recording_3_15s.wav
+!dataset/voice_prompt.pt
+!dataset/trimmed/ref_12s.wav
 output.txt
 output_full.txt
 
@@ -34,3 +48,5 @@ Thumbs.db
 .env.*
 *.key
 *.pem
+*.secret
+credentials.json

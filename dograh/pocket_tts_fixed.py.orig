@@ -1,0 +1,295 @@
+import asyncio
+import aiohttp
+import numpy as np
+from typing import AsyncGenerator, Optional, Dict
+from loguru import logger
+
+from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    ErrorFrame,
+    Frame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
+)
+from pipecat.services.tts_service import TTSService
+from pipecat.services.settings import TTSSettings
+
+# ── NOTE: NO global semaphore. The old global semaphore caused a deadlock:
+#   _push_tts_frames() fires a detached asyncio.create_task() that holds the
+#   semaphore even after the pipeline moves on to the next turn, so every
+#   subsequent synthesis request hangs forever waiting for a lock that will
+#   never be released by the orphaned task.
+#   Instead we use a per-instance lock so concurrent pipeline instances are
+#   independent, and we process sentences sequentially within one instance.
+
+POCKET_TTS_PREDEFINED_VOICES = {
+    'cosette', 'marius', 'javert', 'alba', 'jean', 'anna', 'vera',
+    'fantine', 'charles', 'paul', 'eponine', 'azelma', 'george',
+    'mary', 'jane', 'michael', 'eve', 'bill_boerst', 'peter_yearsley',
+    'stuart_bell', 'caro_davy'
+}
+
+
+class PocketTTSService(TTSService):
+    """
+    Connects Dograh's Pipecat pipeline to a standalone pocket-tts server.
+
+    Key fixes vs. original:
+    1. Per-instance asyncio.Lock instead of a global semaphore — eliminates
+       the cross-turn deadlock caused by detached _push_tts_frames tasks.
+    2. _push_tts_frames() is NO LONGER overridden as a fire-and-forget task.
+       The base-class implementation awaits the generator properly so every
+       turn's audio is fully delivered before the lock is released.
+    3. _remainder_buffer is initialised in __init__ to avoid AttributeError.
+    4. chunk alignment uses int16 (2-byte) math matching the server's actual
+       PCM output format.
+    5. Robust retry logic with fresh sessions on connector errors.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_url: str = "http://pocket-tts:8000",
+        voice_file: Optional[str] = None,
+        voice_id:   Optional[str] = "alba",
+        use_enhanced_pipeline: bool = True,
+        timeout:    int = 300,
+        **kwargs,
+    ):
+        settings = TTSSettings(
+            model=kwargs.get("model", None),
+            voice=voice_id or voice_file or "alba",
+            language=kwargs.get("language", None),
+        )
+        super().__init__(
+            sample_rate=16000,
+            settings=settings,
+            **kwargs
+        )
+        self._api_url = api_url.rstrip("/")
+        self._voice_file = voice_file
+        self._voice_id = voice_id or "alba"
+        self._use_enhanced_pipeline = use_enhanced_pipeline
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._session: Optional[aiohttp.ClientSession] = None
+
+        # Per-instance lock — serialises synthesis within one pipeline
+        # instance without blocking other pipeline instances.
+        self._synthesis_lock = asyncio.Lock()
+
+        # Carry-over bytes from a misaligned chunk boundary
+        self._remainder_buffer: bytes = b""
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Session management
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
+        return self._session
+
+    def can_generate_metrics(self) -> bool:
+        return True
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Payload construction
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_payload(self, text: str) -> Optional[Dict]:
+        """Returns None if text is empty/None — caller must check and skip."""
+        if not text or not str(text).strip():
+            return None
+
+        clean_text = str(text).strip()
+        voice_url = "alba"  # safe fallback
+
+        target_voice = self._voice_id or self._voice_file or "alba"
+
+        if target_voice.startswith("/voices/"):
+            # The Pocket TTS HTTP endpoint rejects raw file paths.
+            # We use the internal Nginx voice-files container to serve it via HTTP.
+            voice_url = f"http://voice-files{target_voice}"
+        elif target_voice.startswith("/app/"):
+            voice_url = target_voice
+        elif any(target_voice.startswith(p) for p in ("hf://", "http://", "https://")):
+            voice_url = target_voice
+        elif target_voice in POCKET_TTS_PREDEFINED_VOICES:
+            voice_url = target_voice
+        elif target_voice == "expresso":
+            voice_url = "hf://kyutai/tts-voices/expresso/ex01-ex02_default_001_channel2_198s.wav"
+
+        return {
+            "text": clean_text,
+            "voice_url": voice_url,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Resampling  24 kHz int16 PCM  →  16 kHz int16 PCM
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _resample_24k_to_16k(self, chunk: bytes) -> bytes:
+        # Strip 44-byte WAV header if present (only on the very first chunk)
+        data = chunk
+        if data.startswith(b'RIFF'):
+            data = data[44:]
+
+        try:
+            # Prepend any carry-over bytes from the previous chunk
+            if self._remainder_buffer:
+                data = self._remainder_buffer + data
+                self._remainder_buffer = b""
+
+            # CRITICAL: server sends int16 PCM — each sample is 2 bytes.
+            # Misaligned chunks produce garbage samples; save the odd byte.
+            remainder = len(data) % 2
+            if remainder:
+                self._remainder_buffer = data[-remainder:]
+                data = data[:-remainder]
+
+            if len(data) == 0:
+                return b""
+
+            # Interpret as signed 16-bit PCM
+            audio_i16 = np.frombuffer(data, dtype=np.int16)
+            if len(audio_i16) == 0:
+                return b""
+
+            # Convert to float32 for interpolation
+            audio_f32 = audio_i16.astype(np.float32) / 32768.0
+
+            old_len = len(audio_f32)
+            new_len = int(old_len * 16000 / 24000)
+            if new_len == 0:
+                return b""
+
+            indices = np.linspace(0, old_len - 1, new_len)
+            resampled = np.interp(indices, np.arange(old_len), audio_f32)
+
+            # Light volume boost for phone-line clarity
+            if self._use_enhanced_pipeline:
+                resampled = np.clip(resampled * 1.2, -1.0, 1.0)
+
+            audio_i16_out = np.clip(resampled * 32767, -32768, 32767).astype(np.int16)
+            return audio_i16_out.tobytes()
+
+        except Exception as e:
+            logger.warning(f"[PocketTTS] Resample failed: {e}")
+            return b""
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Core synthesis
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        """
+        Synthesise *text* and stream audio frames.
+
+        The per-instance lock serialises multiple sentences within one turn so
+        they are spoken in order, while still allowing the pipeline to handle
+        interruptions (CancelledError propagates naturally).
+        """
+        yield TTSStartedFrame(context_id=context_id)
+
+        try:
+            async with self._synthesis_lock:
+                payload = self._build_payload(text)
+
+                if payload is None:
+                    logger.debug(f"[PocketTTS] Skipping empty/None text: {text!r}")
+                    yield TTSStoppedFrame(context_id=context_id)
+                    return
+
+                # Reset chunk-boundary carry-over for each new utterance
+                self._remainder_buffer = b""
+
+                for attempt in range(1, 4):
+                    try:
+                        session = await self._get_session()
+                        logger.info(
+                            f"[PocketTTS] Sending synthesis request"
+                            f" (attempt {attempt}) - text: '{text[:60]}...'"
+                        )
+                        async with session.post(
+                            f"{self._api_url}/tts",
+                            data=payload,
+                        ) as resp:
+                            if resp.status == 400:
+                                body = await resp.text()
+                                logger.error(
+                                    f"[PocketTTS] 400 Bad Request — "
+                                    f"payload: {payload} — body: {body}"
+                                )
+                                yield ErrorFrame(error=f"PocketTTS 400: {body}")
+                                return
+
+                            if resp.status != 200:
+                                body = await resp.text()
+                                logger.warning(
+                                    f"[PocketTTS] HTTP {resp.status} on attempt"
+                                    f" {attempt}: {body}"
+                                )
+                                if attempt < 3:
+                                    await asyncio.sleep(attempt * 2)
+                                    continue
+                                yield ErrorFrame(error=f"PocketTTS HTTP {resp.status}: {body}")
+                                return
+
+                            # Stream chunks — 1200 bytes ≈ 12 ms at 24 kHz int16
+                            chunk_count = 0
+                            async for chunk in resp.content.iter_chunked(1200):
+                                if chunk:
+                                    resampled_audio = self._resample_24k_to_16k(chunk)
+                                    if resampled_audio:
+                                        chunk_count += 1
+                                        yield TTSAudioRawFrame(
+                                            audio=resampled_audio,
+                                            sample_rate=16000,
+                                            num_channels=1,
+                                            context_id=context_id,
+                                        )
+
+                            logger.info(
+                                f"[PocketTTS] Synthesis complete — "
+                                f"{chunk_count} audio chunks yielded"
+                            )
+                            return  # success — exit retry loop
+
+                    except (aiohttp.ClientConnectorError,
+                            aiohttp.ServerDisconnectedError) as e:
+                        logger.warning(
+                            f"[PocketTTS] Connection error on attempt {attempt}: {e}"
+                        )
+                        # Invalidate session so next attempt gets a fresh one
+                        if self._session and not self._session.closed:
+                            await self._session.close()
+                        self._session = None
+                        if attempt < 3:
+                            await asyncio.sleep(attempt * 2)
+                        else:
+                            yield ErrorFrame(error=f"PocketTTS connection failed: {e}")
+
+        except asyncio.CancelledError:
+            logger.debug("[PocketTTS] Synthesis cancelled (pipeline interrupted)")
+        except Exception as e:
+            logger.error(f"[PocketTTS] Unexpected error: {e}", exc_info=True)
+            yield ErrorFrame(error=str(e))
+        finally:
+            yield TTSStoppedFrame(context_id=context_id)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ── IMPORTANT: Do NOT override _push_tts_frames here.
+    #   The original override wrapped the base-class call in
+    #   asyncio.create_task(), turning synthesis into a fire-and-forget
+    #   detached task.  That detached task held _POCKET_TTS_SEMAPHORE while
+    #   the pipeline had already moved on, causing every subsequent turn to
+    #   block forever.  Removing this override restores the correct awaited
+    #   behaviour from TTSService.

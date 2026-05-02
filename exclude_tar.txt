@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+.venv
+__pycache__
+.next
+.cache
+*.zip
+*.tar.gz
